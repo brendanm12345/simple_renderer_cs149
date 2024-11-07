@@ -77,6 +77,7 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    if (N <= 1) return;
     int rounded_length = nextPow2(N); // 1->1, 2->2, 3->4, 7->8, 9->16, etc
 
     // outer loop will execute log(n) times. one loop for each level of depth
@@ -93,7 +94,7 @@ void exclusive_scan(int* input, int N, int* result)
         int numOperations = (rounded_length + two_dplus1 - 1) / two_dplus1;
         int numBlocks = (numOperations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
-        scan_upsweep<<<blocks, THREADS_PER_BLOCK>>>(numOperations, two_d, two_dplus1, result);
+        scan_upsweep<<<numBlocks, THREADS_PER_BLOCK>>>(numOperations, two_d, two_dplus1, result);
         cudaDeviceSynchronize();
 
 
@@ -257,8 +258,8 @@ int find_repeats(int* device_input, int length, int* device_output) {
     int* device_scan_result;
     int count = 0;
 
-    cudaMalloc((void **)&device_input, sizeof(int) * N);
-    cudaMalloc((void **)&device_scan_result, sizeof(int) * N);
+    cudaMalloc((void **)&device_flags, sizeof(int) * length);
+    cudaMalloc((void **)&device_scan_result, sizeof(int) * length);
 
     // calc grid dimensions (use ceiling division)
     int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
@@ -269,11 +270,18 @@ int find_repeats(int* device_input, int length, int* device_output) {
     
     // 2: scan the flags array
     exclusive_scan(device_flags, length, device_scan_result);
-    cudaDeviceSynchronize();
 
     // calc the count
+    int last_scan;
+    // copy the last value (int) of scan_result from device to host. store in last_scan
+    cudaMemcpy(&last_scan, &device_scan_result[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    count = last_scan;
 
     write_repeated_indices<<<blocks, THREADS_PER_BLOCK>>>(device_flags, device_scan_result, length, device_output);
+    cudaDeviceSynchronize();
+
+    cudaFree(device_flags);
+    cudaFree(device_scan_result);
 
     return count; 
 }
