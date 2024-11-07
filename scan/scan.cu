@@ -206,6 +206,27 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void find_equal_neighbors(const int* input, int N, int* flags_out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N - 1) {
+        flags_out[idx] = (input[idx] == input[idx + 1]) ? 1 : 0;
+    } else if (idx == N - 1) {
+        flags_out[idx] = 0;
+    }
+}
+
+// write to our smaller output array
+__global__ void write_repeated_indices(const int* flags, const int* scan_result, int N, int* output) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        if (flags[idx] == 1) {
+            output[scan_result[idx]] = idx;
+        }
+    }
+}
+
+
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -225,8 +246,36 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    
+    // 1. create a 1 hot array withs 1s for repeated elements (i.e. a[i] == a[i+1])
+    // sync
+    // 2. exclusive scan this array to create an index lookup array
+    // sync
+    // 3. for every element in one-hot, if it's a one, write: output[indexLookupArray[i]] = i
 
-    return 0; 
+    int* device_flags;
+    int* device_scan_result;
+    int count = 0;
+
+    cudaMalloc((void **)&device_input, sizeof(int) * N);
+    cudaMalloc((void **)&device_scan_result, sizeof(int) * N);
+
+    // calc grid dimensions (use ceiling division)
+    int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    
+    // 1: find repeated elements
+    find_equal_neighbors<<<blocks, THREADS_PER_BLOCK>>>(device_input, length, device_flags);
+    cudaDeviceSynchronize();
+    
+    // 2: scan the flags array
+    exclusive_scan(device_flags, length, device_scan_result);
+    cudaDeviceSynchronize();
+
+    // calc the count
+
+    write_repeated_indices<<<blocks, THREADS_PER_BLOCK>>>(device_flags, device_scan_result, length, device_output);
+
+    return count; 
 }
 
 
