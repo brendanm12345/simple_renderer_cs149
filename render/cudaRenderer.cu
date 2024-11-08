@@ -14,6 +14,8 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define TILE_SIZE 64
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -379,6 +381,55 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
+__device__ __inline__ void 
+getTileCoordinates(int tileIndex, int* tileX, int* tileY, int numTilesX) {
+    *tileX = tileIndex % numTilesX;
+    *tileY = tileIndex / numTilesX;
+}
+
+__device__ __inline__ int 
+getTileIndex(int tileX, int tileY, int numTilesX) {
+    return tileY * numTilesX + tileX;
+}
+
+__global__ void
+kernelComputeIntersections(
+    int numCircles,
+    int numTilesX,
+    int numTilesY,
+    char* intersectionMatrix,
+    int* tileCounts
+) {
+    // TODO: implement this kernel
+    // 1. calc which circle this thread is responsible for
+    // 2. compute the circle's bounding box
+    // 3. for each tile that might intersect the circle:
+    // — use circleInBoxConservative() and circleInBox()
+    // — update intersection matrix 
+    // - atomically update tileCounts (do we have to)?
+}
+
+__global__ void
+kernelBuildTileLists(
+    // TODO: add params
+) {
+    // TODO: implement this kernel
+    // 1. load tile's intersection data into shared memory
+    // 2. use exclusive scan to compute positions
+    // 3. write circles indices to final lists
+}
+
+__global__ void
+kernelRenderTiles(
+    // TODO: add necessary params
+) {
+    // TODO: implement this kernel
+    // 1. identify which tile and pixel this thread block/thread handles
+    // 2. load the tile's circle list
+    // 3. process the circles in order...
+    // 4. call shadePixel in a for loop to do the updates
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -415,7 +466,8 @@ __global__ void kernelRenderCircles() {
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
-    // for all pixels in the bonding box
+    // COMMENT: this definitely does not need to be done sequentially (ther are no inter dependecies)
+    // for all pixels in the circle's bounding box
     for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
@@ -494,6 +546,12 @@ void
 CudaRenderer::setup() {
 
     int deviceCount = 0;
+
+    // added
+    numTilesX = (image->width + TILE_SIZE - 1) / TILE_SIZE;
+    numTilesY = (image->height + TILE_SIZE - 1) / TILE_SIZE;
+    totalTiles = numTilesX * numTilesY;
+
     std::string name;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
 
@@ -519,6 +577,12 @@ CudaRenderer::setup() {
     //
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
+
+    // TODO: add allocation of data structures
+    // 1. intersection matrix 
+    // 2. tile counts
+    // 3. tile offsets
+    // 4. circle lists (need to determine max size)
 
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numCircles);
@@ -639,6 +703,28 @@ CudaRenderer::render() {
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    // phase 1: compute intersections (build that 2d binary array (intersectionMatrix))
+    kernelComputeIntersections<<<gridDim, blockDim>>>(
+        numCircles,
+        numTilesX,
+        numTilesY,
+        cudaDeviceIntersectionMatrix,
+        cudaDeviceTileCounts, // number of circles intersecting each tile
+    );
+    cudaDeviceSynchronize();
+
+    // phase 2: build tile lists
+    kernelBuildTileLists<<< >>>
+    cudaDeviceSynchronize();
+
+    // phase 3: render tiles
+    dim3 renderBlockDim(16, 16);
+    dim3 renderGridDim(numTilesX, numTilesY);
+    kernelRenderTiles<<<renderGridDim, renderBlockDim>>();
+    cudaDeviceSynchronize();
+
+
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();

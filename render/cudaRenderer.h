@@ -7,32 +7,40 @@
 
 #include "circleRenderer.h"
 
-
-class CudaRenderer : public CircleRenderer {
+class CudaRenderer : public CircleRenderer
+{
 
 private:
-
-    Image* image;
+    Image *image;
     SceneName sceneName;
 
     int numCircles;
-    float* position;
-    float* velocity;
-    float* color;
-    float* radius;
+    float *position;
+    float *velocity;
+    float *color;
+    float *radius;
 
-    float* cudaDevicePosition;
-    float* cudaDeviceVelocity;
-    float* cudaDeviceColor;
-    float* cudaDeviceRadius;
-    float* cudaDeviceImageData;
+    float *cudaDevicePosition;
+    float *cudaDeviceVelocity;
+    float *cudaDeviceColor;
+    float *cudaDeviceRadius;
+    float *cudaDeviceImageData;
+
+    // added
+    char *cudaDeviceIntersectionMatrix; // circle-tile intersection matrix (flattened numTilesxnumCircles array)
+    int *cudaDeviceTileCounts;          // number of circles intersecting each tile
+    int *cudaDeviceCircleLists;         // array storing circle indices for each tile
+    int *cudaDeviceTileOffsets;         // starting index in TileCircleLists for each tile
+
+    int numTilesX;
+    int numTilesY;
+    int totalTiles;
 
 public:
-
     CudaRenderer();
     virtual ~CudaRenderer();
 
-    const Image* getImage();
+    const Image *getImage();
 
     void setup();
 
@@ -50,8 +58,7 @@ public:
         int circleIndex,
         float pixelCenterX, float pixelCenterY,
         float px, float py, float pz,
-        float* pixelData);
+        float *pixelData);
 };
-
 
 #endif
