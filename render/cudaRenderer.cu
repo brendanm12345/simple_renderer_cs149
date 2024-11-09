@@ -13,8 +13,40 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "exclusiveScan.cu_inl"
 
+#define SCAN_BLOCK_DIM 1024
 #define TILE_SIZE 64
+
+////////////////////////////////////////////////////////////////////////////////////////
+// CUDA Error Checking
+///////////////////////////////////////////////////////////////////////////////////////
+
+#define DEBUG  // comment this out when we're done debugging
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n", 
+              cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
+// Also useful to catch errors from kernel launches
+inline void checkCudaErrors(const char *msg) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Cuda Error: %s: %s\n", msg, cudaGetErrorString(err));
+        exit(-1);
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -400,34 +432,143 @@ kernelComputeIntersections(
     char* intersectionMatrix,
     int* tileCounts
 ) {
-    // TODO: implement this kernel
-    // 1. calc which circle this thread is responsible for
-    // 2. compute the circle's bounding box
-    // 3. for each tile that might intersect the circle:
-    // — use circleInBoxConservative() and circleInBox()
-    // — update intersection matrix 
-    // - atomically update tileCounts (do we have to)?
+    // circle parallel threads
+    int circleIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circleIndex >= numCircles) return;
+
+    int index3 = 3 * circleIndex;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float  rad = cuConstRendererParams.radius[index];
+
+    // compute circle's bounding box in screen space
+    float boxL = p.x - rad;
+    float boxR = p.x + rad;
+    float boxB = p.y - rad;
+    float boxT = p.y + rad;
+
+    // convert to tile coordinates (TODO: double check this part)
+    int minTileX = max(0, static_cast<int>(floor(boxL * numTilesX)) - 1);
+    int maxTileX = min(numTilesX - 1, static_cast<int>(floor(boxR * numTilesX)) + 1);
+    int minTileY = max(0, static_cast<int>(floor(boxB * numTilesY)) - 1);
+    int maxTileY = min(numTilesY - 1, static_cast<int>(floor(boxT * numTilesY)) + 1);
+
+    for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
+        for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
+            // get tile index in flattened array
+            int tileIndex = tileY * numTilesX + tileX;
+            
+            // compute tile bounds in normalized [0,1] space
+            float tileBoundsL = static_cast<float>(tileX) / numTilesX;
+            float tileBoundsR = static_cast<float>(tileX + 1) / numTilesX;
+            float tileBoundsB = static_cast<float>(tileY) / numTilesY;
+            float tileBoundsT = static_cast<float>(tileY + 1) / numTilesY;
+            
+            // run efficient conservative test
+            if (circleInBoxConservative(p.x, p.y, rad, tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
+                // if we pass that run exact test
+                if (circleInBox(p.x, p.y, rad, tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
+                    // for totalTiles x numCircles matrix in row major order:
+                    int matrixIndex = tileIndex * numCircles + circleIndex;
+                    intersectionMatrix[matrixIndex] = 1;
+                    // atomically increment tile counts
+                    atomicAdd(&tileCounts[tileIndex], 1);
+                }   
+            }
+        }
+    }
 }
 
 __global__ void
 kernelBuildTileLists(
-    // TODO: add params
+    int numCircles,
+    char* intersectionMatrix, // [totalTiles x numCircles]
+    int* tileCounts, // [totalTiles]
+    int* tileOffsets, // [totalTiles + 1]
+    int* tileCircleLists // final output array containing circles indices for each tile
 ) {
-    // TODO: implement this kernel
+    // this is being run for every tile (so on every binary row in the intersection matrix)
     // 1. load tile's intersection data into shared memory
     // 2. use exclusive scan to compute positions
     // 3. write circles indices to final lists
+
+    int tileIndex = blockIdx.x;
+    if (tileIndex >= numTilesX * numTilesY) return;
+
+    extern __shared__ char sharedMemory[];
+    char* tileIntersections = sharedMemory;
+    uint* scanInput = (uint*)(sharedMemory + SCAN_BLOCK_DIM);
+    uint* scanOutput = (uint*)(sharedMemory + SCAN_BLOCK_DIM + SCAN_BLOCK_DIM * sizeof(uint));
+    uint* scanScratch = (uint*)(sharedMemory + SCAN_BLOCK_DIM + 2 * SCAN_BLOCK_DIM * sizeof(uint));
+
+    for (int i = threadIdx.x; i < SCAN_BLOCK_DIM; i += blockDim.x) {
+        if (i < numCircles) {
+            tileIntersections[i] = intersectionMatrix[tileIndex * numCircles + i];
+            scanInput[i] = (uint)tileIntersections[i];
+        } else {
+            tileIntersections[i] = 0;
+            scanInput[i] = 0;
+        }
+    }
+
+    __syncthreads();
+
+    sharedMemExclusiveScan(threadIdx.x, scanInput, scanOutput, scanScratch, SCAN_BLOCK_DIM);
+    __syncthreads();
+
+    // perform exclusive scan on the intersection data
+    int baseOffset = tileOffsets[tileIndex];
+    for (int i = threadIdx.x; i < numCircles; i += blockDim.x) {
+        if (tileIntersections[i] == 1) {
+            tileCircleLists[baseOffset + scanOutput[i]] = i;
+        }
+    }    
 }
 
 __global__ void
 kernelRenderTiles(
-    // TODO: add necessary params
+    int numCircles,
+    int imageWidth,
+    int imageHeight,
+    int* tileOffsets,
+    int* tileCircleLists,
+    int numTilesX,
+    int numTilesY
 ) {
-    // TODO: implement this kernel
-    // 1. identify which tile and pixel this thread block/thread handles
-    // 2. load the tile's circle list
-    // 3. process the circles in order...
-    // 4. call shadePixel in a for loop to do the updates
+    int tileX = blockIdx.x;
+    int tileY = blockIdx.y;
+    if (tileX >= numTilesX || tileY >= numTilesY) return;
+
+    int tileIndex = tileY * numTilesX + tileX;
+
+    int pixelX = tileX * TILE_SIZE + threadIdx.x;
+    int pixelY = tileY * TILE_SIZE + threadIdx.y;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4, (pixelY * imageWidth + pixelX)]);
+
+    // get normalized pixel's center
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f));
+    
+    // get range of all circles affecting this tile ()
+    int startOffset = tileOffsets[tileIndex];
+    int endOffset = tileOffsets[tileIndex + 1];
+
+    for (int i = startOffset; i < endOffset; i++) {
+        int circleIndex = tileCircleLists[i];
+
+        int index3 = 3 * circleIndex;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+
+        shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+    }
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -518,6 +659,13 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
     }
+
+    if (cudaDeviceIntersectionMatrix) {
+        cudaFree(cudaDeviceIntersectionMatrix);
+        cudaFree(cudaDeviceTileCounts);
+        cudaFree(cudaDeviceTileOffsets);
+        cudaFree(cudaDeviceTileCircleLists);
+    }
 }
 
 const Image*
@@ -546,11 +694,6 @@ void
 CudaRenderer::setup() {
 
     int deviceCount = 0;
-
-    // added
-    numTilesX = (image->width + TILE_SIZE - 1) / TILE_SIZE;
-    numTilesY = (image->height + TILE_SIZE - 1) / TILE_SIZE;
-    totalTiles = numTilesX * numTilesY;
 
     std::string name;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
@@ -594,6 +737,43 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
+
+    // added
+    numTilesX = (image->width + TILE_SIZE - 1) / TILE_SIZE;
+    numTilesY = (image->height + TILE_SIZE - 1) / TILE_SIZE;
+    totalTiles = numTilesX * numTilesY;
+    
+    // intersection matrix
+    cudaCheckError(
+        cudaMalloc(&cudaDeviceIntersectionMatrix, 
+                   sizeof(char) * totalTiles * numCircles));
+    
+    // tile counts array
+    cudaCheckError(
+        cudaMalloc(&cudaDeviceTileCounts, 
+                   sizeof(int) * totalTiles));
+    
+    // tile offsets array (needs +1 for exclusive scan)
+    cudaCheckError(
+        cudaMalloc(&cudaDeviceTileOffsets, 
+                   sizeof(int) * (totalTiles + 1)));
+    
+    // for tile circle lists, first compute maximum possible size (worst case: every circle affects every tile)
+    int maxTotalCircles = totalTiles * numCircles;
+    cudaCheckError(
+        cudaMalloc(&cudaDeviceTileCircleLists, 
+                   sizeof(int) * maxTotalCircles));
+
+    // init arrays to 0
+    cudaCheckError(
+        cudaMemset(cudaDeviceIntersectionMatrix, 0, 
+                  sizeof(char) * totalTiles * numCircles));
+    cudaCheckError(
+        cudaMemset(cudaDeviceTileCounts, 0, 
+                  sizeof(int) * totalTiles));
+    cudaCheckError(
+        cudaMemset(cudaDeviceTileOffsets, 0, 
+                  sizeof(int) * (totalTiles + 1)));
 
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
@@ -714,18 +894,36 @@ CudaRenderer::render() {
     );
     cudaDeviceSynchronize();
 
-    // phase 2: build tile lists
-    kernelBuildTileLists<<< >>>
+    int sharedMemorySize =
+        SCAN_BLOCK_DIM * sizeof(char) + // tileIntersections
+        SCAN_BLOCK_DIM * sizeof(uint) + // scanInput
+        SCAN_BLOCK_DIM * sizeof(uint) + // scanOutput
+        2 * SCAN_BLOCK_DIM * sizeof(uint); // scanScratch
+    
+    dim3 blockDim(SCAN_BLOCK_DIM);
+    dim3 gridDim(totalTiles); // one block per tile
+
+    // phase 2: build tile lists (should be a thread for every binary row in the intersection matrix)
+    kernelBuildTileLists<<<gridDim, blockDim, sharedMemorySize>>>(
+        numCircles,
+        cudaDeviceIntersectionMatrix,
+        cudaDeviceTileCounts,
+        cudaDeviceTileOffsets,
+        cudaDeviceTileCircleLists
+    )
     cudaDeviceSynchronize();
 
     // phase 3: render tiles
     dim3 renderBlockDim(16, 16);
     dim3 renderGridDim(numTilesX, numTilesY);
-    kernelRenderTiles<<<renderGridDim, renderBlockDim>>();
-    cudaDeviceSynchronize();
-
-
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    kernelRenderTiles<<<renderGridDim, renderBlockDim>>>(
+        numCircles,
+        image->width,
+        image->height,
+        cudaDeviceTileOffsets,
+        cudaDeviceTileCircleLists,
+        numTilesX,
+        numTilesY
+    );
     cudaDeviceSynchronize();
 }

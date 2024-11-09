@@ -29,8 +29,8 @@ private:
     // added
     char *cudaDeviceIntersectionMatrix; // circle-tile intersection matrix (flattened numTilesxnumCircles array)
     int *cudaDeviceTileCounts;          // number of circles intersecting each tile
-    int *cudaDeviceCircleLists;         // array storing circle indices for each tile
     int *cudaDeviceTileOffsets;         // starting index in TileCircleLists for each tile
+    int *cudaDeviceTileCircleLists;     // array storing circle indices for each tile
 
     int numTilesX;
     int numTilesY;
