@@ -710,6 +710,237 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+__global__ void kernelBuildBatchTileLists(
+    int startCircle,
+    int circlesInBatch,
+    char* intersectionMatrix,
+    int* tileCounts,
+    int* tileOffsets,
+    int* tileCircleLists,
+    int numTilesX,
+    int numTilesY
+) {
+    int tileIndex = blockIdx.x;
+    if (tileIndex >= numTilesX * numTilesY) return;
+
+    int baseOffset = tileOffsets[tileIndex];
+    int writePos = baseOffset;
+    
+    // Only loop through circles in this batch
+    for (int i = 0; i < circlesInBatch; i++) {
+        if (threadIdx.x == 0) {
+            int matrixIndex = tileIndex * circlesInBatch + i;
+            if (intersectionMatrix[matrixIndex]) {
+                if (writePos < tileOffsets[tileIndex + 1]) {
+                    // Store global circle index
+                    tileCircleLists[writePos] = startCircle + i;
+                    writePos++;
+                }
+            }
+        }
+    }
+}
+
+
+__global__ void kernelComputeBatchIntersections(
+    int startCircle,
+    int circlesInBatch,
+    int numTilesX,
+    int numTilesY,
+    char* intersectionMatrix,
+    int* tileCounts,
+    float* position,
+    float* radius
+) {
+    int localIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (localIndex >= circlesInBatch) return;
+    
+    int circleIndex = startCircle + localIndex;
+    int index3 = 3 * circleIndex;
+
+    // Debug flag for first few circles in batch
+    bool debugCircle = (localIndex < 5);
+
+    // read position and radius
+    float3 p = *(float3*)(&position[index3]);
+    float rad = radius[circleIndex];
+
+    if (debugCircle) {
+        printf("Batch Circle %d (global %d): original pos=(%f,%f,%f) rad=%f\n", 
+               localIndex, circleIndex, p.x, p.y, p.z, rad);
+    }
+
+    // For snow scene: if y position is out of bounds, wrap it back to the top
+    if (cuConstRendererParams.sceneName == SNOWFLAKES ||
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        while (p.y - rad > 1.0f) {
+            p.y -= 1.0f;
+        }
+        while (p.y + rad < 0.0f) {
+            p.y += 1.0f;
+        }
+    }
+
+    if (debugCircle) {
+        printf("Batch Circle %d (global %d): wrapped pos=(%f,%f,%f)\n", 
+               localIndex, circleIndex, p.x, p.y, p.z);
+    }
+
+    // compute circle's bounding box in normalized [0,1] space
+    float boxL = p.x - rad;
+    float boxR = p.x + rad;
+    float boxB = p.y - rad;
+    float boxT = p.y + rad;
+
+    if (debugCircle) {
+        printf("Batch Circle %d (global %d) bounding box: [%f,%f] x [%f,%f]\n",
+               localIndex, circleIndex, boxL, boxR, boxB, boxT);
+    }
+
+    // convert to tile coordinates - carefully handle edge cases
+    int minTileX = max(0, static_cast<int>(floor(boxL * numTilesX)));
+    int maxTileX = min(numTilesX - 1, static_cast<int>(ceil(boxR * numTilesX)));
+    int minTileY = max(0, static_cast<int>(floor(boxB * numTilesY)));
+    int maxTileY = min(numTilesY - 1, static_cast<int>(ceil(boxT * numTilesY)));
+
+    if (debugCircle) {
+        printf("Batch Circle %d (global %d) tile range: x[%d,%d] y[%d,%d]\n",
+               localIndex, circleIndex, minTileX, maxTileX, minTileY, maxTileY);
+    }
+
+    int intersectionCount = 0;
+    for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
+        for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
+            int tileIndex = tileY * numTilesX + tileX;
+            
+            // compute tile bounds in normalized [0,1] space
+            float tileBoundsL = static_cast<float>(tileX) / numTilesX;
+            float tileBoundsR = static_cast<float>(tileX + 1) / numTilesX;
+            float tileBoundsB = static_cast<float>(tileY) / numTilesY;
+            float tileBoundsT = static_cast<float>(tileY + 1) / numTilesY;
+
+            if (debugCircle && intersectionCount < 3) {
+                printf("Batch Circle %d (global %d) testing tile [%d,%d] bounds: [%f,%f] x [%f,%f]\n",
+                       localIndex, circleIndex, tileX, tileY,
+                       tileBoundsL, tileBoundsR, tileBoundsB, tileBoundsT);
+            }
+            
+            // Two-phase intersection test for efficiency
+            if (circleInBoxConservative(p.x, p.y, rad, 
+                                      tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
+                if (circleInBox(p.x, p.y, rad, 
+                              tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
+                    // Use localIndex for intersection matrix since we're processing a batch
+                    int matrixIndex = tileIndex * circlesInBatch + localIndex;
+                    intersectionMatrix[matrixIndex] = 1;
+                    atomicAdd(&tileCounts[tileIndex], 1);
+                    intersectionCount++;
+                    
+                    if (debugCircle) {
+                        printf("Batch Circle %d (global %d) intersects with tile [%d,%d]\n", 
+                               localIndex, circleIndex, tileX, tileY);
+                    }
+                }   
+            }
+        }
+    }
+
+    if (debugCircle) {
+        printf("Batch Circle %d (global %d) found %d tile intersections\n", 
+               localIndex, circleIndex, intersectionCount);
+    }
+}
+
+__global__ void kernelRenderBatchTiles(
+    int startCircle,
+    int circlesInBatch,
+    int imageWidth,
+    int imageHeight,
+    int* tileOffsets,
+    int* tileCircleLists,
+    int numTilesX,
+    int numTilesY
+) {
+    int tileX = blockIdx.x;
+    int tileY = blockIdx.y;
+    if (tileX >= numTilesX || tileY >= numTilesY) return;
+
+    int tileIndex = tileY * numTilesX + tileX;
+    
+    // Calculate boundaries for this tile
+    int tileStartX = tileX * TILE_SIZE;
+    int tileStartY = tileY * TILE_SIZE;
+    int tileEndX = min(tileStartX + TILE_SIZE, imageWidth);
+    int tileEndY = min(tileStartY + TILE_SIZE, imageHeight);
+    
+    // Calculate this thread's pixel
+    int pixelX = tileStartX + threadIdx.x;
+    int pixelY = tileStartY + threadIdx.y;
+
+    // Debug output for first few pixels
+    bool isDebugPixel = (pixelY < 2 && pixelX == 0);
+    
+    if (isDebugPixel) {
+        printf("\nDEBUG Batch: Processing pixel [%d,%d]\n", pixelX, pixelY);
+        printf("In tile [%d,%d] (tile index %d)\n", tileX, tileY, tileIndex);
+        printf("Thread indices [%d,%d]\n", threadIdx.x, threadIdx.y);
+        printf("Tile boundaries: x[%d-%d] y[%d-%d]\n", 
+               tileStartX, tileEndX, tileStartY, tileEndY);
+    }
+
+    // Only process if this pixel is within image bounds
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+
+    // Get pixel pointer
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    
+    // Calculate normalized pixel center
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    // Get circle range for this tile
+    int startOffset = tileOffsets[tileIndex];
+    int endOffset = tileOffsets[tileIndex + 1];
+    
+    if (isDebugPixel) {
+        printf("DEBUG Batch: Processing circles [%d-%d] for pixel [%d,%d]\n", 
+               startOffset, endOffset, pixelX, pixelY);
+        printf("DEBUG Batch: Normalized center: (%f,%f)\n", 
+               pixelCenterNorm.x, pixelCenterNorm.y);
+        
+        float4 currColor = *imgPtr;
+        printf("DEBUG Batch: Starting color: (%f,%f,%f,%f)\n",
+               currColor.x, currColor.y, currColor.z, currColor.w);
+    }
+
+    // Process circles
+    for (int i = startOffset; i < endOffset; i++) {
+        int circleIndex = tileCircleLists[i];
+        
+        // Verify circle index is within the current batch range
+        if (circleIndex >= startCircle && circleIndex < startCircle + circlesInBatch) {
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            
+            if (isDebugPixel) {
+                printf("DEBUG Batch: Processing circle %d at position (%f,%f,%f)\n",
+                       circleIndex, p.x, p.y, p.z);
+            }
+            
+            shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+        }
+    }
+
+    if (isDebugPixel) {
+        float4 finalColor = *imgPtr;
+        printf("DEBUG Batch: Final color for pixel [%d,%d]: (%f,%f,%f,%f)\n",
+               pixelX, pixelY, finalColor.x, finalColor.y, finalColor.z, finalColor.w);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -803,61 +1034,54 @@ CudaRenderer::setup() {
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
     }
     printf("---------------------------------------------------------\n");
-    
-    // By this time the scene should be loaded.  Now copy all the key
-    // data structures into device memory so they are accessible to
-    // CUDA kernels
-    //
-    // See the CUDA Programmer's Guide for descriptions of
-    // cudaMalloc and cudaMemcpy
 
-    // TODO: add allocation of data structures
-    // 1. intersection matrix 
-    // 2. tile counts
-    // 3. tile offsets
-    // 4. circle lists (need to determine max size)
-
+    // Allocate device memory for circle data
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
 
+    // Copy circle data to device
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
-    // added
+    // Calculate tile dimensions
     numTilesX = (image->width + TILE_SIZE - 1) / TILE_SIZE;
     numTilesY = (image->height + TILE_SIZE - 1) / TILE_SIZE;
     totalTiles = numTilesX * numTilesY;
+
+    // Use a fixed batch size instead of trying to handle all circles at once
+    const int BATCH_SIZE = 500000;
     
-    // intersection matrix
+    // Allocate device memory for batch processing
     cudaCheckError(
         cudaMalloc(&cudaDeviceIntersectionMatrix, 
-                   sizeof(char) * totalTiles * numCircles));
+                   sizeof(char) * totalTiles * BATCH_SIZE));
     
-    // tile counts array
     cudaCheckError(
         cudaMalloc(&cudaDeviceTileCounts, 
                    sizeof(int) * totalTiles));
     
-    // tile offsets array (needs +1 for exclusive scan)
     cudaCheckError(
         cudaMalloc(&cudaDeviceTileOffsets, 
                    sizeof(int) * (totalTiles + 1)));
     
-    // for tile circle lists, first compute maximum possible size (worst case: every circle affects every tile)
-    int maxTotalCircles = totalTiles * numCircles;
+    // Allocate circle list with a more realistic maximum size
+    // Assume each circle affects at most 4 tiles on average
+    const int avgTilesPerCircle = 4;
+    int estimatedMaxCircles = min(BATCH_SIZE * avgTilesPerCircle, totalTiles * BATCH_SIZE);
+    
     cudaCheckError(
         cudaMalloc(&cudaDeviceTileCircleLists, 
-                   sizeof(int) * maxTotalCircles));
+                   sizeof(int) * estimatedMaxCircles));
 
-    // init arrays to 0
+    // Initialize arrays to 0
     cudaCheckError(
         cudaMemset(cudaDeviceIntersectionMatrix, 0, 
-                  sizeof(char) * totalTiles * numCircles));
+                  sizeof(char) * totalTiles * BATCH_SIZE));
     cudaCheckError(
         cudaMemset(cudaDeviceTileCounts, 0, 
                   sizeof(int) * totalTiles));
@@ -865,14 +1089,7 @@ CudaRenderer::setup() {
         cudaMemset(cudaDeviceTileOffsets, 0, 
                   sizeof(int) * (totalTiles + 1)));
 
-    // Initialize parameters in constant memory.  We didn't talk about
-    // constant memory in class, but the use of read-only constant
-    // memory here is an optimization over just sticking these values
-    // in device global memory.  NVIDIA GPUs have a few special tricks
-    // for optimizing access to constant memory.  Using global memory
-    // here would have worked just as well.  See the Programmer's
-    // Guide for more information about constant memory.
-
+    // Setup constant memory parameters
     GlobalConstants params;
     params.sceneName = sceneName;
     params.numCircles = numCircles;
@@ -978,157 +1195,99 @@ __global__ void kernelComputeOffsets(int* tileCounts, int* tileOffsets, int numT
     }
 }
 
-void
-CudaRenderer::render() {
-    // Clear image using scene-specific kernel
-    dim3 blockDim(16, 16, 1);
-    dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y);
+void CudaRenderer::render() {
+    // Clear image first
+    dim3 clearBlockDim(16, 16, 1);
+    dim3 clearGridDim(
+        (image->width + clearBlockDim.x - 1) / clearBlockDim.x,
+        (image->height + clearBlockDim.y - 1) / clearBlockDim.y);
 
     if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
-        kernelClearImageSnowflake<<<gridDim, blockDim>>>();
+        kernelClearImageSnowflake<<<clearGridDim, clearBlockDim>>>();
     } else {
-        kernelClearImage<<<gridDim, blockDim>>>(1.f, 1.f, 1.f, 1.f);
+        kernelClearImage<<<clearGridDim, clearBlockDim>>>(1.f, 1.f, 1.f, 1.f);
     }
     cudaDeviceSynchronize();
 
-    printf("\n=== Starting Phase 1 ===\n");
-    printf("Image dimensions: %dx%d\n", image->width, image->height);
-    printf("Tile dimensions: %dx%d (total tiles: %d)\n", numTilesX, numTilesY, totalTiles);
-    printf("Number of circles: %d\n", numCircles);
+    // Calculate batch size based on available memory
+    // Reserve ~2GB for intersection matrix
+    const int BATCH_SIZE = 500000; // Process 500K circles at a time
+    const int numBatches = (numCircles + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    // phase 1
-    dim3 blockDim1(256, 1);
-    dim3 gridDim1((numCircles + blockDim1.x - 1) / blockDim1.x);
-    kernelComputeIntersections<<<gridDim1, blockDim1>>>(
-        numCircles,
-        numTilesX,
-        numTilesY,
-        cudaDeviceIntersectionMatrix,
-        cudaDeviceTileCounts
-    );
-    cudaDeviceSynchronize();
-    
-    // Debug: Check tile counts
-    int* hostTileCounts = new int[totalTiles];
-    cudaMemcpy(hostTileCounts, cudaDeviceTileCounts, sizeof(int) * totalTiles, cudaMemcpyDeviceToHost);
-    int totalCirclesFound = 0;
-    for (int i = 0; i < totalTiles; i++) {
-        totalCirclesFound += hostTileCounts[i];
-    }
-    printf("Phase 1 Debug: Found %d circle-tile intersections\n", totalCirclesFound);
-    delete[] hostTileCounts;
+    // Allocate smaller intersection matrix for the batch
+    char* batchIntersectionMatrix;
+    int* batchTileCounts;
+    int* batchTileOffsets;
+    int* batchTileCircleLists;
 
-    // Debug first few tile counts
-    hostTileCounts = new int[5];
-    cudaMemcpy(hostTileCounts, cudaDeviceTileCounts, sizeof(int) * 5, cudaMemcpyDeviceToHost);
-    printf("\nFirst 5 tile counts:\n");
-    for(int i = 0; i < 5; i++) {
-        printf("Tile %d: %d circles\n", i, hostTileCounts[i]);
-    }
-    delete[] hostTileCounts;
+    cudaMalloc(&batchIntersectionMatrix, sizeof(char) * totalTiles * BATCH_SIZE);
+    cudaMalloc(&batchTileCounts, sizeof(int) * totalTiles);
+    cudaMalloc(&batchTileOffsets, sizeof(int) * (totalTiles + 1));
+    cudaMalloc(&batchTileCircleLists, sizeof(int) * totalTiles * BATCH_SIZE);
 
-    // After Phase 1, let's check what circles affect the first tile:
-    char* hostIntersectionMatrix = new char[numCircles];
-    cudaMemcpy(hostIntersectionMatrix, cudaDeviceIntersectionMatrix, 
-               sizeof(char) * numCircles, cudaMemcpyDeviceToHost);
-    printf("\nCircles intersecting first tile:\n");
-    int count = 0;
-    for(int i = 0; i < numCircles && count < 5; i++) {
-        if(hostIntersectionMatrix[i]) {
-            printf("Circle %d intersects\n", i);
-            count++;
-        }
-    }
-    delete[] hostIntersectionMatrix;
+    // Process circles in batches
+    for (int batch = 0; batch < numBatches; batch++) {
+        int startCircle = batch * BATCH_SIZE;
+        int circlesInBatch = min(BATCH_SIZE, numCircles - startCircle);
 
-    printf("\n=== Starting Phase 2 ===\n");
+        // Clear batch data structures
+        cudaMemset(batchIntersectionMatrix, 0, sizeof(char) * totalTiles * BATCH_SIZE);
+        cudaMemset(batchTileCounts, 0, sizeof(int) * totalTiles);
+        cudaMemset(batchTileOffsets, 0, sizeof(int) * (totalTiles + 1));
 
-    // First, verify our tile counts
-    hostTileCounts = new int[5];
-    cudaMemcpy(hostTileCounts, cudaDeviceTileCounts, 
-               sizeof(int) * 5, cudaMemcpyDeviceToHost);
-    printf("\nFirst 5 tile counts:\n");
-    for(int i = 0; i < 5; i++) {
-        printf("Tile %d: %d circles\n", i, hostTileCounts[i]);
-    }
-    delete[] hostTileCounts;
+        // Phase 1: Compute intersections for this batch
+        dim3 blockDim1(256, 1);
+        dim3 gridDim1((circlesInBatch + blockDim1.x - 1) / blockDim1.x);
+        
+        kernelComputeBatchIntersections<<<gridDim1, blockDim1>>>(
+            startCircle,
+            circlesInBatch,
+            numTilesX,
+            numTilesY,
+            batchIntersectionMatrix,
+            batchTileCounts,
+            cudaDevicePosition,
+            cudaDeviceRadius
+        );
+        cudaDeviceSynchronize();
 
-    // Compute offsets using GPU kernel
-    kernelComputeOffsets<<<1, 1>>>(cudaDeviceTileCounts, 
-                                  cudaDeviceTileOffsets, 
-                                  totalTiles);
-    cudaDeviceSynchronize();
-    checkCudaErrors("Offset computation");
+        // Phase 2: Compute offsets and build circle lists
+        kernelComputeOffsets<<<1, 1>>>(batchTileCounts, batchTileOffsets, totalTiles);
+        cudaDeviceSynchronize();
 
-    // Verify offsets
-    int hostOffsets[5];
-    cudaMemcpy(hostOffsets, cudaDeviceTileOffsets, 
-               sizeof(int) * 5, cudaMemcpyDeviceToHost);
-    printf("\nFirst few offsets:\n");
-    for(int i = 0; i < 5; i++) {
-        printf("Tile %d offset: %d\n", i, hostOffsets[i]);
+        dim3 blockDim2(32);
+        dim3 gridDim2(totalTiles);
+        kernelBuildBatchTileLists<<<gridDim2, blockDim2>>>(
+            startCircle,
+            circlesInBatch,
+            batchIntersectionMatrix,
+            batchTileCounts,
+            batchTileOffsets,
+            batchTileCircleLists,
+            numTilesX,
+            numTilesY
+        );
+        cudaDeviceSynchronize();
+
+        // Phase 3: Render tiles for this batch
+        dim3 blockDim3(16, 16);
+        dim3 gridDim3(numTilesX, numTilesY);
+        kernelRenderBatchTiles<<<gridDim3, blockDim3>>>(
+            startCircle,
+            circlesInBatch,
+            image->width,
+            image->height,
+            batchTileOffsets,
+            batchTileCircleLists,
+            numTilesX,
+            numTilesY
+        );
+        cudaDeviceSynchronize();
     }
 
-    // Phase 2
-    printf("\nStarting Phase 2 with tileCircleLists construction\n");
-    
-    // Clear the output array first
-    cudaMemset(cudaDeviceTileCircleLists, 0, sizeof(int) * totalCirclesFound);
-    cudaDeviceSynchronize();
-    
-    dim3 blockDim2(32);  // Reduced thread count since only one thread per block is active
-    dim3 gridDim2(totalTiles);
-    
-    kernelBuildTileLists<<<gridDim2, blockDim2>>>(
-        numCircles,
-        cudaDeviceIntersectionMatrix,
-        cudaDeviceTileCounts,
-        cudaDeviceTileOffsets,
-        cudaDeviceTileCircleLists,
-        numTilesX,
-        numTilesY
-    );
-    cudaDeviceSynchronize();
-    checkCudaErrors("Phase 2 kernel");
-    
-    // Verify the results
-    printf("\nVerifying first tile results:\n");
-    
-    // First get the count for the first tile
-    int firstTileCount;
-    cudaMemcpy(&firstTileCount, cudaDeviceTileCounts, sizeof(int), cudaMemcpyDeviceToHost);
-    int verifyCount = min(5, firstTileCount);
-    
-    // Now verify the circle indices
-    if (verifyCount > 0) {
-        int* hostCircleLists = new int[verifyCount];
-        cudaMemcpy(hostCircleLists, cudaDeviceTileCircleLists, sizeof(int) * verifyCount, cudaMemcpyDeviceToHost);
-        printf("First %d circles in first tile:\n", verifyCount);
-        for (int i = 0; i < verifyCount; i++) {
-            printf("Position %d: Circle %d\n", i, hostCircleLists[i]);
-        }
-        delete[] hostCircleLists;
-    }
-
-    printf("\n=== Starting Phase 3 ===\n");
-    
-    // Phase 3 launch
-    dim3 blockDim3(16, 16);
-    dim3 gridDim3(numTilesX, numTilesY);
-    printf("Launching Phase 3 with grid(%d,%d) block(%d,%d)\n",
-           numTilesX, numTilesY, blockDim3.x, blockDim3.y);
-           
-    kernelRenderTiles<<<gridDim3, blockDim3>>>(
-        numCircles,
-        image->width,
-        image->height,
-        cudaDeviceTileOffsets,
-        cudaDeviceTileCircleLists,
-        numTilesX,
-        numTilesY
-    );
-    cudaDeviceSynchronize();
-    checkCudaErrors("Phase 3 kernel");
+    // Clean up batch resources
+    cudaFree(batchIntersectionMatrix);
+    cudaFree(batchTileCounts);
+    cudaFree(batchTileOffsets);
+    cudaFree(batchTileCircleLists);
 }
