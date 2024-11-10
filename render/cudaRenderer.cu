@@ -98,7 +98,6 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // Clear the image, setting the image to the white-gray gradation that
 // is used in the snowflake image
 __global__ void kernelClearImageSnowflake() {
-
     int imageX = blockIdx.x * blockDim.x + threadIdx.x;
     int imageY = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -109,12 +108,17 @@ __global__ void kernelClearImageSnowflake() {
         return;
 
     int offset = 4 * (imageY * width + imageX);
+    
+    // Compute gradient based on y position
     float shade = .4f + .45f * static_cast<float>(height-imageY) / height;
-    float4 value = make_float4(shade, shade, shade, 1.f);
+    
+    // Debug first few pixels
+    if (imageY < 2 && imageX == 0) {
+        printf("Setting background at [%d][%d] to %f\n", 
+               imageX, imageY, shade);
+    }
 
-    // write to global memory: As an optimization, I use a float4
-    // store, that results in more efficient code than if I coded this
-    // up as four seperate fp32 stores.
+    float4 value = make_float4(shade, shade, shade, 1.f);
     *(float4*)(&cuConstRendererParams.imageData[offset]) = value;
 }
 
@@ -432,31 +436,64 @@ kernelComputeIntersections(
     char* intersectionMatrix,
     int* tileCounts
 ) {
-    // circle parallel threads
     int circleIndex = blockIdx.x * blockDim.x + threadIdx.x;
     if (circleIndex >= numCircles) return;
+
+    bool debugCircle = (circleIndex < 5);
 
     int index3 = 3 * circleIndex;
 
     // read position and radius
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[circleIndex];
+    float rad = cuConstRendererParams.radius[circleIndex];
 
-    // compute circle's bounding box in screen space
+    if (debugCircle) {
+        printf("Circle %d: original pos=(%f,%f,%f) rad=%f\n", 
+               circleIndex, p.x, p.y, p.z, rad);
+    }
+
+    // For snow scene: if y position is out of bounds, wrap it back to the top
+    // This mimics the snowflake animation behavior
+    if (cuConstRendererParams.sceneName == SNOWFLAKES ||
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        while (p.y - rad > 1.0f) {
+            p.y -= 1.0f;
+        }
+        while (p.y + rad < 0.0f) {
+            p.y += 1.0f;
+        }
+    }
+
+    if (debugCircle) {
+        printf("Circle %d: wrapped pos=(%f,%f,%f)\n", 
+               circleIndex, p.x, p.y, p.z);
+    }
+
+    // compute circle's bounding box in normalized [0,1] space
     float boxL = p.x - rad;
     float boxR = p.x + rad;
     float boxB = p.y - rad;
     float boxT = p.y + rad;
 
-    // convert to tile coordinates (TODO: double check this part)
-    int minTileX = max(0, static_cast<int>(floor(boxL * numTilesX)) - 1);
-    int maxTileX = min(numTilesX - 1, static_cast<int>(floor(boxR * numTilesX)) + 1);
-    int minTileY = max(0, static_cast<int>(floor(boxB * numTilesY)) - 1);
-    int maxTileY = min(numTilesY - 1, static_cast<int>(floor(boxT * numTilesY)) + 1);
+    if (debugCircle) {
+        printf("Circle %d bounding box: [%f,%f] x [%f,%f]\n",
+               circleIndex, boxL, boxR, boxB, boxT);
+    }
 
+    // convert to tile coordinates - carefully handle edge cases
+    int minTileX = max(0, static_cast<int>(floor(boxL * numTilesX)));
+    int maxTileX = min(numTilesX - 1, static_cast<int>(ceil(boxR * numTilesX)));
+    int minTileY = max(0, static_cast<int>(floor(boxB * numTilesY)));
+    int maxTileY = min(numTilesY - 1, static_cast<int>(ceil(boxT * numTilesY)));
+
+    if (debugCircle) {
+        printf("Circle %d tile range: x[%d,%d] y[%d,%d]\n",
+               circleIndex, minTileX, maxTileX, minTileY, maxTileY);
+    }
+
+    int intersectionCount = 0;
     for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
         for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-            // get tile index in flattened array
             int tileIndex = tileY * numTilesX + tileX;
             
             // compute tile bounds in normalized [0,1] space
@@ -464,19 +501,34 @@ kernelComputeIntersections(
             float tileBoundsR = static_cast<float>(tileX + 1) / numTilesX;
             float tileBoundsB = static_cast<float>(tileY) / numTilesY;
             float tileBoundsT = static_cast<float>(tileY + 1) / numTilesY;
+
+            if (debugCircle && intersectionCount < 3) {
+                printf("Circle %d testing tile [%d,%d] bounds: [%f,%f] x [%f,%f]\n",
+                       circleIndex, tileX, tileY,
+                       tileBoundsL, tileBoundsR, tileBoundsB, tileBoundsT);
+            }
             
-            // run efficient conservative test
-            if (circleInBoxConservative(p.x, p.y, rad, tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
-                // if we pass that run exact test
-                if (circleInBox(p.x, p.y, rad, tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
-                    // for totalTiles x numCircles matrix in row major order:
+            if (circleInBoxConservative(p.x, p.y, rad, 
+                                      tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
+                if (circleInBox(p.x, p.y, rad, 
+                              tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
                     int matrixIndex = tileIndex * numCircles + circleIndex;
                     intersectionMatrix[matrixIndex] = 1;
-                    // atomically increment tile counts
                     atomicAdd(&tileCounts[tileIndex], 1);
+                    intersectionCount++;
+                    
+                    if (debugCircle) {
+                        printf("Circle %d intersects with tile [%d,%d]\n", 
+                               circleIndex, tileX, tileY);
+                    }
                 }   
             }
         }
+    }
+
+    if (debugCircle) {
+        printf("Circle %d found %d tile intersections\n", 
+               circleIndex, intersectionCount);
     }
 }
 
@@ -552,10 +604,11 @@ __global__ void kernelRenderTiles(
     int pixelX = tileStartX + threadIdx.x;
     int pixelY = tileStartY + threadIdx.y;
 
-    // Debug output for specific pixels
-    bool isDebugPixel = (pixelX == 0 && (pixelY == 16 || pixelY == 17));
+    // Debug output for first few pixels
+    bool isDebugPixel = (pixelY < 2 && pixelX == 0);
+    
     if (isDebugPixel) {
-        printf("\nDEBUG: Processing pixel [0,%d]\n", pixelY);
+        printf("\nDEBUG: Processing pixel [%d,%d]\n", pixelX, pixelY);
         printf("In tile [%d,%d] (tile index %d)\n", tileX, tileY, tileIndex);
         printf("Thread indices [%d,%d]\n", threadIdx.x, threadIdx.y);
         printf("Tile boundaries: x[%d-%d] y[%d-%d]\n", 
@@ -563,24 +616,14 @@ __global__ void kernelRenderTiles(
     }
 
     // Only process if this pixel is within image bounds
-    if (pixelX >= imageWidth || pixelY >= imageHeight) {
-        if (isDebugPixel) {
-            printf("DEBUG: Pixel [0,%d] rejected due to bounds check\n", pixelY);
-        }
-        return;
-    }
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
 
     // Get pixel pointer
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     
-    // Initialize pixel color to white
-    float4 currColor = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
-    *imgPtr = currColor;
-
-    if (isDebugPixel) {
-        printf("DEBUG: Initialized color to white for pixel [0,%d]\n", pixelY);
-    }
-
+    // For snow scene, we rely on kernelClearImageSnowflake to set initial color
+    // We don't need to initialize here
+    
     // Calculate normalized pixel center
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
@@ -593,10 +636,14 @@ __global__ void kernelRenderTiles(
     int endOffset = tileOffsets[tileIndex + 1];
     
     if (isDebugPixel) {
-        printf("DEBUG: Processing circles [%d-%d] for pixel [0,%d]\n", 
-               startOffset, endOffset, pixelY);
+        printf("DEBUG: Processing circles [%d-%d] for pixel [%d,%d]\n", 
+               startOffset, endOffset, pixelX, pixelY);
         printf("DEBUG: Normalized center: (%f,%f)\n", 
                pixelCenterNorm.x, pixelCenterNorm.y);
+        
+        float4 currColor = *imgPtr;
+        printf("DEBUG: Starting color: (%f,%f,%f,%f)\n",
+               currColor.x, currColor.y, currColor.z, currColor.w);
     }
 
     // Process circles
@@ -604,27 +651,13 @@ __global__ void kernelRenderTiles(
         int circleIndex = tileCircleLists[i];
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[circleIndex];
-
-        if (isDebugPixel) {
-            float diffX = p.x - pixelCenterNorm.x;
-            float diffY = p.y - pixelCenterNorm.y;
-            float pixelDist = diffX * diffX + diffY * diffY;
-            float maxDist = rad * rad;
-            
-            if (pixelDist <= maxDist) {
-                printf("DEBUG: Circle %d affects pixel [0,%d] - pos(%f,%f,%f) rad=%f\n",
-                       circleIndex, pixelY, p.x, p.y, p.z, rad);
-            }
-        }
-
         shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
     }
 
     if (isDebugPixel) {
         float4 finalColor = *imgPtr;
-        printf("DEBUG: Final color for pixel [0,%d]: (%f,%f,%f,%f)\n",
-               pixelY, finalColor.x, finalColor.y, finalColor.z, finalColor.w);
+        printf("DEBUG: Final color for pixel [%d,%d]: (%f,%f,%f,%f)\n",
+               pixelX, pixelY, finalColor.x, finalColor.y, finalColor.z, finalColor.w);
     }
 }
 
@@ -947,6 +980,19 @@ __global__ void kernelComputeOffsets(int* tileCounts, int* tileOffsets, int numT
 
 void
 CudaRenderer::render() {
+    // Clear image using scene-specific kernel
+    dim3 blockDim(16, 16, 1);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
+
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelClearImageSnowflake<<<gridDim, blockDim>>>();
+    } else {
+        kernelClearImage<<<gridDim, blockDim>>>(1.f, 1.f, 1.f, 1.f);
+    }
+    cudaDeviceSynchronize();
+
     printf("\n=== Starting Phase 1 ===\n");
     printf("Image dimensions: %dx%d\n", image->width, image->height);
     printf("Tile dimensions: %dx%d (total tiles: %d)\n", numTilesX, numTilesY, totalTiles);
@@ -1068,15 +1114,6 @@ CudaRenderer::render() {
 
     printf("\n=== Starting Phase 3 ===\n");
     
-    // Initialize the image with proper white color
-    dim3 blockDim(16, 16);
-    dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y
-    );
-    kernelClearImage<<<gridDim, blockDim>>>(1.0f, 1.0f, 1.0f, 0.0f);
-    cudaDeviceSynchronize();
-
     // Phase 3 launch
     dim3 blockDim3(16, 16);
     dim3 gridDim3(numTilesX, numTilesY);
