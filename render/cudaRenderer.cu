@@ -13,10 +13,11 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
-#include "exclusiveScan.cu_inl"
-
-#define SCAN_BLOCK_DIM 1024
 #define TILE_SIZE 64
+#define SCAN_BLOCK_DIM 1024
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
+
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // CUDA Error Checking
@@ -440,7 +441,7 @@ kernelComputeIntersections(
 
     // read position and radius
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+    float  rad = cuConstRendererParams.radius[circleIndex];
 
     // compute circle's bounding box in screen space
     float boxL = p.x - rad;
@@ -486,7 +487,9 @@ kernelBuildTileLists(
     char* intersectionMatrix, // [totalTiles x numCircles]
     int* tileCounts, // [totalTiles]
     int* tileOffsets, // [totalTiles + 1]
-    int* tileCircleLists // final output array containing circles indices for each tile
+    int* tileCircleLists, // final output array containing circles indices for each tile
+    int numTilesX,
+    int numTilesY
 ) {
     // this is being run for every tile (so on every binary row in the intersection matrix)
     // 1. load tile's intersection data into shared memory
@@ -547,7 +550,7 @@ kernelRenderTiles(
 
     if (pixelX >= imageWidth || pixelY >= imageHeight) return;
 
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4, (pixelY * imageWidth + pixelX)]);
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
 
     // get normalized pixel's center
     float invWidth = 1.f / imageWidth;
@@ -879,44 +882,52 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
-    // phase 1: compute intersections (build that 2d binary array (intersectionMatrix))
-    kernelComputeIntersections<<<gridDim, blockDim>>>(
+    // phase 1
+    dim3 blockDim1(256, 1);
+    dim3 gridDim1((numCircles + blockDim1.x - 1) / blockDim1.x);
+    kernelComputeIntersections<<<gridDim1, blockDim1>>>(
         numCircles,
         numTilesX,
         numTilesY,
         cudaDeviceIntersectionMatrix,
-        cudaDeviceTileCounts, // number of circles intersecting each tile
+        cudaDeviceTileCounts
     );
     cudaDeviceSynchronize();
-
-    int sharedMemorySize =
-        SCAN_BLOCK_DIM * sizeof(char) + // tileIntersections
-        SCAN_BLOCK_DIM * sizeof(uint) + // scanInput
-        SCAN_BLOCK_DIM * sizeof(uint) + // scanOutput
-        2 * SCAN_BLOCK_DIM * sizeof(uint); // scanScratch
     
-    dim3 blockDim(SCAN_BLOCK_DIM);
-    dim3 gridDim(totalTiles); // one block per tile
+    // Debug: Check tile counts
+    int* hostTileCounts = new int[totalTiles];
+    cudaMemcpy(hostTileCounts, cudaDeviceTileCounts, sizeof(int) * totalTiles, cudaMemcpyDeviceToHost);
+    int totalCirclesFound = 0;
+    for (int i = 0; i < totalTiles; i++) {
+        totalCirclesFound += hostTileCounts[i];
+    }
+    printf("Phase 1 Debug: Found %d circle-tile intersections\n", totalCirclesFound);
+    delete[] hostTileCounts;
 
-    // phase 2: build tile lists (should be a thread for every binary row in the intersection matrix)
-    kernelBuildTileLists<<<gridDim, blockDim, sharedMemorySize>>>(
+    // phase 2
+    int sharedMemorySize =
+        SCAN_BLOCK_DIM * sizeof(char) +
+        SCAN_BLOCK_DIM * sizeof(uint) +
+        SCAN_BLOCK_DIM * sizeof(uint) +
+        2 * SCAN_BLOCK_DIM * sizeof(uint);
+    
+    dim3 blockDim2(SCAN_BLOCK_DIM);
+    dim3 gridDim2(totalTiles);
+    kernelBuildTileLists<<<gridDim2, blockDim2, sharedMemorySize>>>(
         numCircles,
         cudaDeviceIntersectionMatrix,
         cudaDeviceTileCounts,
         cudaDeviceTileOffsets,
-        cudaDeviceTileCircleLists
-    )
+        cudaDeviceTileCircleLists,
+        numTilesX,
+        numTilesY
+    );
     cudaDeviceSynchronize();
 
-    // phase 3: render tiles
-    dim3 renderBlockDim(16, 16);
-    dim3 renderGridDim(numTilesX, numTilesY);
-    kernelRenderTiles<<<renderGridDim, renderBlockDim>>>(
+    // phase 3
+    dim3 blockDim3(16, 16);
+    dim3 gridDim3(numTilesX, numTilesY);
+    kernelRenderTiles<<<gridDim3, blockDim3>>>(
         numCircles,
         image->width,
         image->height,
@@ -926,4 +937,11 @@ CudaRenderer::render() {
         numTilesY
     );
     cudaDeviceSynchronize();
+
+    // // 256 threads per block is a healthy number
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
 }
