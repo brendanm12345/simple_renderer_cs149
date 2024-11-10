@@ -491,6 +491,7 @@ kernelComputeIntersections(
                circleIndex, minTileX, maxTileX, minTileY, maxTileY);
     }
 
+    // TODO: we can prob parallelize this later on
     int intersectionCount = 0;
     for (int tileY = minTileY; tileY <= maxTileY; tileY++) {
         for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
@@ -514,7 +515,7 @@ kernelComputeIntersections(
                               tileBoundsL, tileBoundsR, tileBoundsT, tileBoundsB)) {
                     int matrixIndex = tileIndex * numCircles + circleIndex;
                     intersectionMatrix[matrixIndex] = 1;
-                    atomicAdd(&tileCounts[tileIndex], 1);
+                    atomicAdd(&tileCounts[tileIndex], 1); // TODO: Replace with prefix sum + figure out how to calculate total number of intersections
                     intersectionCount++;
                     
                     if (debugCircle) {
