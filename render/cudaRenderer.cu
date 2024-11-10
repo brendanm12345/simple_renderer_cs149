@@ -13,11 +13,12 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
-#define TILE_SIZE 64
+#define TILE_SIZE 16
 #define SCAN_BLOCK_DIM 1024
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
 
+#include <thrust/scan.h> 
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // CUDA Error Checking
@@ -354,31 +355,21 @@ __global__ void kernelAdvanceSnowflake() {
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
 shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = cuConstRendererParams.radius[circleIndex];
     float maxDist = rad * rad;
 
-    // circle does not contribute to the image
     if (pixelDist > maxDist)
         return;
 
     float3 rgb;
     float alpha;
 
-    // there is a non-zero contribution.  Now compute the shading value
-
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
         const float kCircleMaxAlpha = .5f;
         const float falloffScale = 4.f;
 
@@ -386,11 +377,9 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         rgb = lookupColor(normPixelDist);
 
         float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
     } else {
-        // simple: each circle has an assigned color
         int index3 = 3 * circleIndex;
         rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
@@ -398,20 +387,30 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float oneMinusAlpha = 1.f - alpha;
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
+    // Read current color, ensuring we have valid initial values
     float4 existingColor = *imagePtr;
+    if (isnan(existingColor.x) || isnan(existingColor.y) || isnan(existingColor.z)) {
+        existingColor = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
+    }
+
+    // Compute new color
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
 
-    // global memory write
-    *imagePtr = newColor;
+    // Debug output for pixel [0,0]
+    if (pixelCenter.x == 0.5f/cuConstRendererParams.imageWidth && 
+        pixelCenter.y == 0.5f/cuConstRendererParams.imageHeight) {
+        printf("Circle %d: rgb=(%f,%f,%f) alpha=%f\n", 
+               circleIndex, rgb.x, rgb.y, rgb.z, alpha);
+        printf("Existing: (%f,%f,%f,%f) -> New: (%f,%f,%f,%f)\n",
+               existingColor.x, existingColor.y, existingColor.z, existingColor.w,
+               newColor.x, newColor.y, newColor.z, newColor.w);
+    }
 
-    // END SHOULD-BE-ATOMIC REGION
+    *imagePtr = newColor;
 }
 
 __device__ __inline__ void 
@@ -481,56 +480,54 @@ kernelComputeIntersections(
     }
 }
 
-__global__ void
-kernelBuildTileLists(
+__global__ void kernelBuildTileLists(
     int numCircles,
-    char* intersectionMatrix, // [totalTiles x numCircles]
-    int* tileCounts, // [totalTiles]
-    int* tileOffsets, // [totalTiles + 1]
-    int* tileCircleLists, // final output array containing circles indices for each tile
+    char* intersectionMatrix,
+    int* tileCounts,
+    int* tileOffsets,
+    int* tileCircleLists,
     int numTilesX,
     int numTilesY
 ) {
-    // this is being run for every tile (so on every binary row in the intersection matrix)
-    // 1. load tile's intersection data into shared memory
-    // 2. use exclusive scan to compute positions
-    // 3. write circles indices to final lists
-
     int tileIndex = blockIdx.x;
     if (tileIndex >= numTilesX * numTilesY) return;
 
-    extern __shared__ char sharedMemory[];
-    char* tileIntersections = sharedMemory;
-    uint* scanInput = (uint*)(sharedMemory + SCAN_BLOCK_DIM);
-    uint* scanOutput = (uint*)(sharedMemory + SCAN_BLOCK_DIM + SCAN_BLOCK_DIM * sizeof(uint));
-    uint* scanScratch = (uint*)(sharedMemory + SCAN_BLOCK_DIM + 2 * SCAN_BLOCK_DIM * sizeof(uint));
+    // Debug first tile
+    if (tileIndex == 0 && threadIdx.x == 0) {
+        printf("\nFirst tile debug info:\n");
+        printf("Tile count: %d\n", tileCounts[tileIndex]);
+        printf("Base offset: %d\n", tileOffsets[tileIndex]);
+        printf("numCircles: %d\n", numCircles);
+    }
 
-    for (int i = threadIdx.x; i < SCAN_BLOCK_DIM; i += blockDim.x) {
-        if (i < numCircles) {
-            tileIntersections[i] = intersectionMatrix[tileIndex * numCircles + i];
-            scanInput[i] = (uint)tileIntersections[i];
-        } else {
-            tileIntersections[i] = 0;
-            scanInput[i] = 0;
+    int baseOffset = tileOffsets[tileIndex];
+    int writePos = baseOffset;
+    
+    // Loop through circles serially for now
+    for (int i = 0; i < numCircles; i++) {
+        if (threadIdx.x == 0) {  // Only one thread per tile
+            int matrixIndex = tileIndex * numCircles + i;
+            if (intersectionMatrix[matrixIndex]) {
+                if (writePos < tileOffsets[tileIndex + 1]) {
+                    tileCircleLists[writePos] = i;
+                    writePos++;
+                    
+                    // Debug first tile's writes
+                    if (tileIndex == 0 && (writePos - baseOffset) <= 5) {
+                        printf("First tile: Writing circle %d at position %d\n", i, writePos - 1);
+                    }
+                }
+            }
         }
     }
 
-    __syncthreads();
-
-    sharedMemExclusiveScan(threadIdx.x, scanInput, scanOutput, scanScratch, SCAN_BLOCK_DIM);
-    __syncthreads();
-
-    // perform exclusive scan on the intersection data
-    int baseOffset = tileOffsets[tileIndex];
-    for (int i = threadIdx.x; i < numCircles; i += blockDim.x) {
-        if (tileIntersections[i] == 1) {
-            tileCircleLists[baseOffset + scanOutput[i]] = i;
-        }
-    }    
+    // Debug completion
+    if (tileIndex == 0 && threadIdx.x == 0) {
+        printf("First tile completed. Start: %d, End: %d\n", baseOffset, writePos);
+    }
 }
 
-__global__ void
-kernelRenderTiles(
+__global__ void kernelRenderTiles(
     int numCircles,
     int imageWidth,
     int imageHeight,
@@ -544,33 +541,90 @@ kernelRenderTiles(
     if (tileX >= numTilesX || tileY >= numTilesY) return;
 
     int tileIndex = tileY * numTilesX + tileX;
+    
+    // Calculate boundaries for this tile
+    int tileStartX = tileX * TILE_SIZE;
+    int tileStartY = tileY * TILE_SIZE;
+    int tileEndX = min(tileStartX + TILE_SIZE, imageWidth);
+    int tileEndY = min(tileStartY + TILE_SIZE, imageHeight);
+    
+    // Calculate this thread's pixel
+    int pixelX = tileStartX + threadIdx.x;
+    int pixelY = tileStartY + threadIdx.y;
 
-    int pixelX = tileX * TILE_SIZE + threadIdx.x;
-    int pixelY = tileY * TILE_SIZE + threadIdx.y;
+    // Debug output for specific pixels
+    bool isDebugPixel = (pixelX == 0 && (pixelY == 16 || pixelY == 17));
+    if (isDebugPixel) {
+        printf("\nDEBUG: Processing pixel [0,%d]\n", pixelY);
+        printf("In tile [%d,%d] (tile index %d)\n", tileX, tileY, tileIndex);
+        printf("Thread indices [%d,%d]\n", threadIdx.x, threadIdx.y);
+        printf("Tile boundaries: x[%d-%d] y[%d-%d]\n", 
+               tileStartX, tileEndX, tileStartY, tileEndY);
+    }
 
-    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+    // Only process if this pixel is within image bounds
+    if (pixelX >= imageWidth || pixelY >= imageHeight) {
+        if (isDebugPixel) {
+            printf("DEBUG: Pixel [0,%d] rejected due to bounds check\n", pixelY);
+        }
+        return;
+    }
 
+    // Get pixel pointer
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    
+    // Initialize pixel color to white
+    float4 currColor = make_float4(1.0f, 1.0f, 1.0f, 0.0f);
+    *imgPtr = currColor;
 
-    // get normalized pixel's center
+    if (isDebugPixel) {
+        printf("DEBUG: Initialized color to white for pixel [0,%d]\n", pixelY);
+    }
+
+    // Calculate normalized pixel center
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
-
     float2 pixelCenterNorm = make_float2(
         invWidth * (static_cast<float>(pixelX) + 0.5f),
         invHeight * (static_cast<float>(pixelY) + 0.5f));
-    
-    // get range of all circles affecting this tile ()
+
+    // Get circle range for this tile
     int startOffset = tileOffsets[tileIndex];
     int endOffset = tileOffsets[tileIndex + 1];
+    
+    if (isDebugPixel) {
+        printf("DEBUG: Processing circles [%d-%d] for pixel [0,%d]\n", 
+               startOffset, endOffset, pixelY);
+        printf("DEBUG: Normalized center: (%f,%f)\n", 
+               pixelCenterNorm.x, pixelCenterNorm.y);
+    }
 
+    // Process circles
     for (int i = startOffset; i < endOffset; i++) {
         int circleIndex = tileCircleLists[i];
-
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[circleIndex];
+
+        if (isDebugPixel) {
+            float diffX = p.x - pixelCenterNorm.x;
+            float diffY = p.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+            float maxDist = rad * rad;
+            
+            if (pixelDist <= maxDist) {
+                printf("DEBUG: Circle %d affects pixel [0,%d] - pos(%f,%f,%f) rad=%f\n",
+                       circleIndex, pixelY, p.x, p.y, p.z, rad);
+            }
+        }
 
         shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+    }
+
+    if (isDebugPixel) {
+        float4 finalColor = *imgPtr;
+        printf("DEBUG: Final color for pixel [0,%d]: (%f,%f,%f,%f)\n",
+               pixelY, finalColor.x, finalColor.y, finalColor.z, finalColor.w);
     }
 }
 
@@ -880,8 +934,24 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+__global__ void kernelComputeOffsets(int* tileCounts, int* tileOffsets, int numTiles) {
+    int runningSum = 0;
+    tileOffsets[0] = 0;  // first offset is always 0
+    
+    for (int i = 0; i < numTiles; i++) {
+        int currentCount = tileCounts[i];
+        tileOffsets[i + 1] = runningSum + currentCount;
+        runningSum += currentCount;
+    }
+}
+
 void
 CudaRenderer::render() {
+    printf("\n=== Starting Phase 1 ===\n");
+    printf("Image dimensions: %dx%d\n", image->width, image->height);
+    printf("Tile dimensions: %dx%d (total tiles: %d)\n", numTilesX, numTilesY, totalTiles);
+    printf("Number of circles: %d\n", numCircles);
+
     // phase 1
     dim3 blockDim1(256, 1);
     dim3 gridDim1((numCircles + blockDim1.x - 1) / blockDim1.x);
@@ -904,16 +974,68 @@ CudaRenderer::render() {
     printf("Phase 1 Debug: Found %d circle-tile intersections\n", totalCirclesFound);
     delete[] hostTileCounts;
 
-    // phase 2
-    int sharedMemorySize =
-        SCAN_BLOCK_DIM * sizeof(char) +
-        SCAN_BLOCK_DIM * sizeof(uint) +
-        SCAN_BLOCK_DIM * sizeof(uint) +
-        2 * SCAN_BLOCK_DIM * sizeof(uint);
+    // Debug first few tile counts
+    hostTileCounts = new int[5];
+    cudaMemcpy(hostTileCounts, cudaDeviceTileCounts, sizeof(int) * 5, cudaMemcpyDeviceToHost);
+    printf("\nFirst 5 tile counts:\n");
+    for(int i = 0; i < 5; i++) {
+        printf("Tile %d: %d circles\n", i, hostTileCounts[i]);
+    }
+    delete[] hostTileCounts;
+
+    // After Phase 1, let's check what circles affect the first tile:
+    char* hostIntersectionMatrix = new char[numCircles];
+    cudaMemcpy(hostIntersectionMatrix, cudaDeviceIntersectionMatrix, 
+               sizeof(char) * numCircles, cudaMemcpyDeviceToHost);
+    printf("\nCircles intersecting first tile:\n");
+    int count = 0;
+    for(int i = 0; i < numCircles && count < 5; i++) {
+        if(hostIntersectionMatrix[i]) {
+            printf("Circle %d intersects\n", i);
+            count++;
+        }
+    }
+    delete[] hostIntersectionMatrix;
+
+    printf("\n=== Starting Phase 2 ===\n");
+
+    // First, verify our tile counts
+    hostTileCounts = new int[5];
+    cudaMemcpy(hostTileCounts, cudaDeviceTileCounts, 
+               sizeof(int) * 5, cudaMemcpyDeviceToHost);
+    printf("\nFirst 5 tile counts:\n");
+    for(int i = 0; i < 5; i++) {
+        printf("Tile %d: %d circles\n", i, hostTileCounts[i]);
+    }
+    delete[] hostTileCounts;
+
+    // Compute offsets using GPU kernel
+    kernelComputeOffsets<<<1, 1>>>(cudaDeviceTileCounts, 
+                                  cudaDeviceTileOffsets, 
+                                  totalTiles);
+    cudaDeviceSynchronize();
+    checkCudaErrors("Offset computation");
+
+    // Verify offsets
+    int hostOffsets[5];
+    cudaMemcpy(hostOffsets, cudaDeviceTileOffsets, 
+               sizeof(int) * 5, cudaMemcpyDeviceToHost);
+    printf("\nFirst few offsets:\n");
+    for(int i = 0; i < 5; i++) {
+        printf("Tile %d offset: %d\n", i, hostOffsets[i]);
+    }
+
+    // Phase 2
+    printf("\nStarting Phase 2 with tileCircleLists construction\n");
     
-    dim3 blockDim2(SCAN_BLOCK_DIM);
+    // Clear the output array first
+    cudaMemset(cudaDeviceTileCircleLists, 0, sizeof(int) * totalCirclesFound);
+    cudaDeviceSynchronize();
+    
+    dim3 blockDim2(32);  // Reduced thread count since only one thread per block is active
     dim3 gridDim2(totalTiles);
-    kernelBuildTileLists<<<gridDim2, blockDim2, sharedMemorySize>>>(
+    
+    kernelBuildTileLists<<<gridDim2, blockDim2>>>(
         numCircles,
         cudaDeviceIntersectionMatrix,
         cudaDeviceTileCounts,
@@ -923,10 +1045,44 @@ CudaRenderer::render() {
         numTilesY
     );
     cudaDeviceSynchronize();
+    checkCudaErrors("Phase 2 kernel");
+    
+    // Verify the results
+    printf("\nVerifying first tile results:\n");
+    
+    // First get the count for the first tile
+    int firstTileCount;
+    cudaMemcpy(&firstTileCount, cudaDeviceTileCounts, sizeof(int), cudaMemcpyDeviceToHost);
+    int verifyCount = min(5, firstTileCount);
+    
+    // Now verify the circle indices
+    if (verifyCount > 0) {
+        int* hostCircleLists = new int[verifyCount];
+        cudaMemcpy(hostCircleLists, cudaDeviceTileCircleLists, sizeof(int) * verifyCount, cudaMemcpyDeviceToHost);
+        printf("First %d circles in first tile:\n", verifyCount);
+        for (int i = 0; i < verifyCount; i++) {
+            printf("Position %d: Circle %d\n", i, hostCircleLists[i]);
+        }
+        delete[] hostCircleLists;
+    }
 
-    // phase 3
+    printf("\n=== Starting Phase 3 ===\n");
+    
+    // Initialize the image with proper white color
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y
+    );
+    kernelClearImage<<<gridDim, blockDim>>>(1.0f, 1.0f, 1.0f, 0.0f);
+    cudaDeviceSynchronize();
+
+    // Phase 3 launch
     dim3 blockDim3(16, 16);
     dim3 gridDim3(numTilesX, numTilesY);
+    printf("Launching Phase 3 with grid(%d,%d) block(%d,%d)\n",
+           numTilesX, numTilesY, blockDim3.x, blockDim3.y);
+           
     kernelRenderTiles<<<gridDim3, blockDim3>>>(
         numCircles,
         image->width,
@@ -937,11 +1093,5 @@ CudaRenderer::render() {
         numTilesY
     );
     cudaDeviceSynchronize();
-
-    // // 256 threads per block is a healthy number
-    // dim3 blockDim(256, 1);
-    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
-    // kernelRenderCircles<<<gridDim, blockDim>>>();
-    // cudaDeviceSynchronize();
+    checkCudaErrors("Phase 3 kernel");
 }
