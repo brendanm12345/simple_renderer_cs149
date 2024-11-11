@@ -26,15 +26,17 @@ private:
     float *cudaDeviceRadius;
     float *cudaDeviceImageData;
 
-    // added
-    char *cudaDeviceIntersectionMatrix; // circle-tile intersection matrix (flattened numTilesxnumCircles array)
-    int *cudaDeviceTileCounts;          // number of circles intersecting each tile
-    int *cudaDeviceTileOffsets;         // starting index in TileCircleLists for each tile
-    int *cudaDeviceTileCircleLists;     // array storing circle indices for each tile
+    // ADDED
 
+    static const int TILE_SIZE = 64;
     int numTilesX;
     int numTilesY;
     int totalTiles;
+
+    char *cudaDeviceIntersectionMatrix; // binary matrix [numTiles x numCircles]
+    int *cudaDeviceTileCounts;          // count of circles per tile
+    int *cudaDeviceTileOffsets;         // prefix sum of tileCounts (for indexing)
+    int *cudaDeviceTileCircleLists;     // final ordered circle lists per tile
 
 public:
     CudaRenderer();
