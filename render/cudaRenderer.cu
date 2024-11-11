@@ -542,76 +542,55 @@ __global__ void kernelComputeOffsets(int* tileCounts, int* tileOffsets, int numT
     }
 }
 
+// pack tile info together to improve memory access
+struct TileInfo {
+    int tileIndex;      // which tile we're processing
+    int baseOffset;     // where this tile starts writing in the output array
+    int numCircles;     // how many circles intersect this tile
+};
+
 __global__ void kernelBuildTileLists(
     int numCircles,
-    char* intersectionMatrix,
-    int* tileCounts,
-    int* tileOffsets,
-    int* tileCircleLists,
+    char* intersectionMatrix,   // [numTiles][numCircles] matrix
+    int* tileCounts,            // [numTiles] array of circle counts per tile
+    int* tileOffsets,           // [numTiles+1] array of output offsets
+    int* tileCircleLists,       // output array containing circle indices
     int numTilesX,
     int numTilesY
 ) {
-    // one thread block per tile
-    int tileIndex = blockIdx.x;
+    int tileIndex = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     if (tileIndex >= numTilesX * numTilesY) return;
 
-    // shared memory for chunk processing
-    __shared__ uint prefixInput[SCAN_BLOCK_DIM];
-    __shared__ uint prefixOutput[SCAN_BLOCK_DIM];
-    __shared__ uint prefixScratch[2 * SCAN_BLOCK_DIM];
+    // get lane ID within warp (0-31)
+    int laneId = threadIdx.x & 31;
     
-    int linearThreadIndex = threadIdx.x;
+    
+    // in our old implementation we might access: [0-255], [256-511], ...
+    // our new way accesses: [0-31], [32-63], ... (perfect warp alignment)
     int matrixRowStart = tileIndex * numCircles;
     int baseOffset = tileOffsets[tileIndex];
+    int numCirclesInTile = tileCounts[tileIndex];
     
-    // process the intersection matrix row in chunks
-    int runningOffset = 0;
-    
-    for (int chunkStart = 0; chunkStart < numCircles; chunkStart += SCAN_BLOCK_DIM) {
-        // clear shared memory
-        prefixInput[linearThreadIndex] = 0;
+    // process circles in chunks of 32 to ensure optimal memory coalescing
+    for (int circleStart = 0; circleStart < numCircles; circleStart += 32) {
+        // each thread in warp loads one circle's intersection data
+        int circleIdx = circleStart + laneId;
+        bool hasIntersection = (circleIdx < numCircles) && 
+                              intersectionMatrix[matrixRowStart + circleIdx];
+         
+        // create a MASK of which threads have intersections
+        unsigned int intersectionMask = __ballot_sync(0xffffffff, hasIntersection);
         
-        // load this chunk of the intersection matrix row
-        int circleIndex = chunkStart + linearThreadIndex;
-        if (circleIndex < numCircles) {
-            prefixInput[linearThreadIndex] = 
-                intersectionMatrix[matrixRowStart + circleIndex];
-        }
-        __syncthreads();
+        // popc is like exclusive scan but for binary arrays. so this counts the number of 1s in intersectionMask
+        int numIntersectionsBefore = __popc(intersectionMask & ((1u << laneId) - 1));
         
-        // scan chunk
-        sharedMemExclusiveScan(linearThreadIndex,
-                              prefixInput,
-                              prefixOutput,
-                              prefixScratch,
-                              SCAN_BLOCK_DIM);
-        __syncthreads();
-        
-        // write cirlces from chunk
-        circleIndex = chunkStart + linearThreadIndex;
-        if (circleIndex < numCircles) {
-            if (intersectionMatrix[matrixRowStart + circleIndex]) {
-                int writeIndex = baseOffset + runningOffset + prefixOutput[linearThreadIndex];
-                tileCircleLists[writeIndex] = circleIndex;
-            }
+        // if intersects, write circleId to global array (writes are coalesced since positions are consecutive) 
+        if (hasIntersection) {
+            tileCircleLists[baseOffset + numIntersectionsBefore] = circleIdx;
         }
         
-        // Update running offset for next chunk
-        // Need to add number of intersections found in this chunk
-        __shared__ int chunkTotal;
-        if (linearThreadIndex == 0) {
-            chunkTotal = 0;
-            for (int i = 0; i < SCAN_BLOCK_DIM && (chunkStart + i) < numCircles; i++) {
-                chunkTotal += prefixInput[i];
-            }
-        }
-        __syncthreads();
-        
-        runningOffset += chunkTotal;
-        // if (linearThreadIndex == 0) {
-        //     printf("Tile %d: chunk starting at %d processed, running offset = %d\n", 
-        //            tileIndex, chunkStart, runningOffset);
-        // }
+        // update base offset for next chunk by adding total number of intersections found in this warp
+        baseOffset += __popc(intersectionMask);
     }
 }
 
@@ -913,6 +892,11 @@ CudaRenderer::setup() {
         cudaMalloc(&cudaDeviceIntersectionMatrix, 
                    sizeof(char) * totalTiles * numCircles));
     
+    // allocate the transposed intersection matrix and count arrays (256 tiles * 1M circles ~ 256MB)
+    cudaCheckError(
+        cudaMalloc(&cudaDeviceIntersectionMatrixTransposed, 
+                   sizeof(char) * numCircles * totalTiles));
+    
     cudaCheckError(
         cudaMalloc(&cudaDeviceTileCounts, 
                    sizeof(int) * totalTiles));
@@ -1096,8 +1080,9 @@ void CudaRenderer::render() {
                    sizeof(int) * totalIntersections));
 
     // phase 2: build circle lists
-    dim3 blockDim2(SCAN_BLOCK_DIM, 1);  // must match scan size
-    dim3 gridDim2(totalTiles, 1);
+    dim3 blockDim2(256, 1);  // must match scan size
+    dim3 gridDim2((totalTiles + 7) / 8, 1);
+
     kernelBuildTileLists<<<gridDim2, blockDim2>>>(
         numCircles,
         cudaDeviceIntersectionMatrix,

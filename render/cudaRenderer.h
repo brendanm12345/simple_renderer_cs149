@@ -33,10 +33,11 @@ private:
     int numTilesY;
     int totalTiles;
 
-    char *cudaDeviceIntersectionMatrix; // binary matrix [numTiles x numCircles]
-    int *cudaDeviceTileCounts;          // count of circles per tile
-    int *cudaDeviceTileOffsets;         // prefix sum of tileCounts (for indexing)
-    int *cudaDeviceTileCircleLists;     // final ordered circle lists per tile
+    char *cudaDeviceIntersectionMatrix;           // binary matrix [numTiles x numCircles]
+    char *cudaDeviceIntersectionMatrixTransposed; // [numCircles x numTiles]
+    int *cudaDeviceTileCounts;                    // count of circles per tile
+    int *cudaDeviceTileOffsets;                   // prefix sum of tileCounts (for indexing)
+    int *cudaDeviceTileCircleLists;               // final ordered circle lists per tile
 
 public:
     CudaRenderer();
