@@ -13,9 +13,9 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
-#define TILE_SIZE 32
+#define TILE_SIZE 64
 #define SCAN_BLOCK_DIM 1024
-#define RENDER_CHUNK_SIZE 256
+#define RENDER_CHUNK_SIZE 512
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
 
@@ -418,7 +418,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     *imagePtr = newColor;
 }
 
-// Phase 1a: Just compute intersections
+// phase 1a: Just compute intersections
 __global__ void kernelComputeIntersections(
     int numCircles,
     int numTilesX,
@@ -481,7 +481,7 @@ __global__ void kernelComputeIntersections(
     }
 }
 
-// Phase 1b: Compute tile counts using prefix sum
+// phase 1b: compute tile counts using warp-level operations
 __global__ void kernelComputeTileCounts(
     int numCircles,
     int numTilesX,
@@ -489,41 +489,30 @@ __global__ void kernelComputeTileCounts(
     char* intersectionMatrix,
     int* tileCounts
 ) {
-    // One thread block per tile
-    int tileIndex = blockIdx.x;
+    int tileIndex = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     if (tileIndex >= numTilesX * numTilesY) return;
 
-    // Shared memory for prefix sum
-    __shared__ uint prefixInput[SCAN_BLOCK_DIM];
-    __shared__ uint prefixOutput[SCAN_BLOCK_DIM];
-    __shared__ uint prefixScratch[2 * SCAN_BLOCK_DIM];
-
-    // Load intersection data into shared memory
-    int linearThreadIndex = threadIdx.x;
+    int laneId = threadIdx.x & 31;
+    
     int matrixRowStart = tileIndex * numCircles;
     
-    // Each thread loads and sums its portion of the intersection matrix row
-    prefixInput[linearThreadIndex] = 0;
-    for (int i = linearThreadIndex; i < numCircles; i += SCAN_BLOCK_DIM) {
-        prefixInput[linearThreadIndex] += intersectionMatrix[matrixRowStart + i];
+    int total = 0;
+    
+    
+    for (int circleStart = 0; circleStart < numCircles; circleStart += 32) {
+        int circleIdx = circleStart + laneId;
+        bool hasIntersection = (circleIdx < numCircles) && 
+                              intersectionMatrix[matrixRowStart + circleIdx];
+        
+        unsigned int intersectionMask = __ballot_sync(0xffffffff, hasIntersection);
+        
+        if (laneId == 0) {
+            total += __popc(intersectionMask);
+        }
     }
-    __syncthreads();
-
-    // Perform exclusive scan
-    sharedMemExclusiveScan(linearThreadIndex, 
-                          prefixInput,
-                          prefixOutput, 
-                          prefixScratch,
-                          SCAN_BLOCK_DIM);
-    __syncthreads();
-
-    // First thread writes the total count for this tile
-    if (linearThreadIndex == 0) {
-        // Total is last prefix sum result plus last input value
-        int lastValue = prefixInput[SCAN_BLOCK_DIM - 1];
-        int total = prefixOutput[SCAN_BLOCK_DIM - 1] + lastValue;
+    
+    if (laneId == 0) {
         tileCounts[tileIndex] = total;
-        // printf("Tile %d has %d circles\n", tileIndex, tileCounts[tileIndex]);
     }
 }
 
@@ -594,10 +583,17 @@ __global__ void kernelBuildTileLists(
     }
 }
 
-// pack the data for a circle next to each other for quick access
+// // pack the data for a circle next to each other for quick access
+// struct CircleData {
+//     float3 position;
+//     float radius;
+// };
+
 struct CircleData {
     float3 position;
     float radius;
+    float3 color;
+    float alpha;
 };
 
 __global__ void kernelRenderTiles(
@@ -715,7 +711,6 @@ __global__ void kernelRenderTiles(
         __syncthreads();
     }
 }
-
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -1044,8 +1039,8 @@ void CudaRenderer::render() {
     cudaDeviceSynchronize();
 
     // phase 1b: compute tile counts using prefix sum
-    dim3 blockDim1b(SCAN_BLOCK_DIM, 1);
-    dim3 gridDim1b(totalTiles, 1);
+    dim3 blockDim1b(256, 1);
+    dim3 gridDim1b((totalTiles + 7) / 8, 1);
     kernelComputeTileCounts<<<gridDim1b, blockDim1b>>>(
         numCircles,
         numTilesX,
