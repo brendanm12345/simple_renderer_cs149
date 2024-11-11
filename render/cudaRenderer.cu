@@ -15,6 +15,7 @@
 #include "util.h"
 #define TILE_SIZE 32
 #define SCAN_BLOCK_DIM 1024
+#define RENDER_CHUNK_SIZE 256
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
 
@@ -612,7 +613,7 @@ __global__ void kernelBuildTileLists(
         //            tileIndex, chunkStart, runningOffset);
         // }
     }
-} 
+}
 
 __global__ void kernelRenderTiles(
     int numCircles,
@@ -635,6 +636,7 @@ __global__ void kernelRenderTiles(
     int tileEndX = min(tileStartX + TILE_SIZE, imageWidth);
     int tileEndY = min(tileStartY + TILE_SIZE, imageHeight);
     
+    // TODO: optimziation opportunity: parallelize this no inter dependencies
     // loop through pixels in tile
     for (int py = threadIdx.y; py < TILE_SIZE; py += blockDim.y) {
         for (int px = threadIdx.x; px < TILE_SIZE; px += blockDim.x) {
@@ -669,6 +671,128 @@ __global__ void kernelRenderTiles(
                 shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
             }
         }
+    }
+}
+
+// pack the data for a circle next to each other for quick access
+struct CircleData {
+    float3 position;
+    float radius;
+};
+
+__global__ void kernelRenderTiles(
+    int numCircles,
+    int imageWidth,
+    int imageHeight,
+    int* tileOffsets,
+    int* tileCircleLists,
+    int numTilesX,
+    int numTilesY
+) { 
+    int tileX = blockIdx.x;
+    int tileY = blockIdx.y;
+    if (tileX >= numTilesX || tileY >= numTilesY) return;
+
+    int tileIndex = tileY * numTilesX + tileX;
+    
+    // calculate tile boundaries
+    int tileStartX = tileX * TILE_SIZE;
+    int tileStartY = tileY * TILE_SIZE;
+    int tileEndX = min(tileStartX + TILE_SIZE, imageWidth);
+    int tileEndY = min(tileStartY + TILE_SIZE, imageHeight);
+    
+    // allocate shared memory arrays visible to all threads in the block
+    __shared__ CircleData sharedCircles[RENDER_CHUNK_SIZE];
+    __shared__ float3 sharedColors[RENDER_CHUNK_SIZE];
+    
+    // calculate the number of circles that overlap this tile
+    int startOffset = tileOffsets[tileIndex];
+    int endOffset = tileOffsets[tileIndex + 1];
+    int numCirclesInTile = endOffset - startOffset;
+    
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // process circles in chunks, each iteration handles 256 circles
+    for (int chunkStart = 0; chunkStart < numCirclesInTile; chunkStart += RENDER_CHUNK_SIZE) {
+        int circlesInChunk = min(RENDER_CHUNK_SIZE, numCirclesInTile - chunkStart);
+        
+        // load circle data into shared memory (use a strided pattern to interleave loading)
+        for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < circlesInChunk; i += blockDim.x * blockDim.y) {
+            int circleIndex = tileCircleLists[startOffset + chunkStart + i];
+            int index3 = 3 * circleIndex;
+            
+            // load position and radius
+            sharedCircles[i].position = *(float3*)(&cuConstRendererParams.position[index3]);
+            sharedCircles[i].radius = cuConstRendererParams.radius[circleIndex];
+            
+            // load color
+            sharedColors[i] = *(float3*)(&cuConstRendererParams.color[index3]);
+        }
+        __syncthreads();
+        
+        // each thread processes multiple pixels, also in a strided manner
+        for (int py = threadIdx.y; py < TILE_SIZE; py += blockDim.y) {
+            int pixelY = tileStartY + py;
+            if (pixelY >= imageHeight) continue;
+            
+            for (int px = threadIdx.x; px < TILE_SIZE; px += blockDim.x) {
+                int pixelX = tileStartX + px;
+                if (pixelX >= imageWidth) continue;
+
+                // calculate global memory location for this pixel
+                float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+                // calculate pixel coordinates to normalized space [0,1]
+                float2 pixelCenterNorm = make_float2(
+                    invWidth * (static_cast<float>(pixelX) + 0.5f),
+                    invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+                // key: use local var to avoid repeated global memory access
+                float4 accumColor = *imgPtr;
+                
+                // loop through our chunk of circles and shade the pixels they contribute to
+                for (int i = 0; i < circlesInChunk; i++) {
+                    float3 p = sharedCircles[i].position;
+                    float rad = sharedCircles[i].radius;
+                    
+                    // distance check to see if pixel is within circle's radius
+                    float diffX = p.x - pixelCenterNorm.x;
+                    float diffY = p.y - pixelCenterNorm.y;
+                    float pixelDist = diffX * diffX + diffY * diffY;
+                    float maxDist = rad * rad;
+                    
+                    if (pixelDist <= maxDist) {
+                        // Circle contributes to pixel
+                        float3 rgb = sharedColors[i];
+                        float alpha = .5f;
+                        
+                        if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+                            cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+                            const float kCircleMaxAlpha = .5f;
+                            const float falloffScale = 4.f;
+                            
+                            float normPixelDist = sqrt(pixelDist) / rad;
+                            rgb = lookupColor(normPixelDist);
+                            
+                            float maxAlpha = .6f + .4f * (1.f-p.z);
+                            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+                        }
+                        
+                        // blend color into accumulator
+                        float oneMinusAlpha = 1.f - alpha;
+                        accumColor.x = alpha * rgb.x + oneMinusAlpha * accumColor.x;
+                        accumColor.y = alpha * rgb.y + oneMinusAlpha * accumColor.y;
+                        accumColor.z = alpha * rgb.z + oneMinusAlpha * accumColor.z;
+                        accumColor.w = alpha + accumColor.w;
+                    }
+                }
+                
+                // write accumulated color back to global memory
+                *imgPtr = accumColor;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -1045,7 +1169,7 @@ void CudaRenderer::render() {
     cudaDeviceSynchronize();
 
     // phase 3: render tiles
-    dim3 blockDim3(8, 8);
+    dim3 blockDim3(32, 32);
     dim3 gridDim3(numTilesX, numTilesY);
     
     kernelRenderTiles<<<gridDim3, blockDim3>>>(
