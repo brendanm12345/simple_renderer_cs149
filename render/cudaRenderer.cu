@@ -516,18 +516,46 @@ __global__ void kernelComputeTileCounts(
     }
 }
 
-// handle prefix sum of tile counts (small array doesn't need to be parallelized)
 __global__ void kernelComputeOffsets(int* tileCounts, int* tileOffsets, int numTiles) {
-    // might want to parallelize this for very large numTiles
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        int runningSum = 0;
-        tileOffsets[0] = 0;  // first offset is always 0
+    // use shared memory for exclusive scan
+    __shared__ uint scanInput[SCAN_BLOCK_DIM];
+    __shared__ uint scanOutput[SCAN_BLOCK_DIM];
+    __shared__ uint scanScratch[2 * SCAN_BLOCK_DIM];
+    
+    int tid = threadIdx.x;
+    
+    // process in chunks of SCAN_BLOCK_DIM elements
+    for (int base = 0; base < numTiles; base += SCAN_BLOCK_DIM) {
+        // clear shared memory
+        scanInput[tid] = 0;
+        scanOutput[tid] = 0;
+        __syncthreads();
         
-        for (int i = 0; i < numTiles; i++) {
-            int currentCount = tileCounts[i];
-            tileOffsets[i + 1] = runningSum + currentCount;
-            runningSum += currentCount;
+        // load chunk's counts into shared memory
+        if (base + tid < numTiles) {
+            scanInput[tid] = tileCounts[base + tid];
         }
+        __syncthreads();
+        
+        // exclusive scan
+        sharedMemExclusiveScan(tid, scanInput, scanOutput, scanScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+        
+        // write results to global memory
+        if (base + tid < numTiles) {
+            // For all except the first element of each chunk, add the sum from previous chunks
+            uint prevSum = 0;
+            if (base > 0) {
+                prevSum = tileOffsets[base];
+            }
+            tileOffsets[base + tid + 1] = scanOutput[tid] + scanInput[tid] + prevSum;
+        }
+        __syncthreads();
+    }
+    
+    // Ensure first offset is always 0
+    if (tid == 0) {
+        tileOffsets[0] = 0;
     }
 }
 
@@ -1050,8 +1078,9 @@ void CudaRenderer::render() {
     );
     cudaDeviceSynchronize();
     
-    // compute offsets using our kernel
-    kernelComputeOffsets<<<1, 1>>>(
+    // compute offsets using efficient shared memory scan
+    // launch with exactly SCAN_BLOCK_DIM threads (required by sharedMemExclusiveScan)
+    kernelComputeOffsets<<<1, SCAN_BLOCK_DIM>>>(
         cudaDeviceTileCounts,
         cudaDeviceTileOffsets,
         totalTiles
