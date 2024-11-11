@@ -615,65 +615,6 @@ __global__ void kernelBuildTileLists(
     }
 }
 
-__global__ void kernelRenderTiles(
-    int numCircles,
-    int imageWidth,
-    int imageHeight,
-    int* tileOffsets,
-    int* tileCircleLists,
-    int numTilesX,
-    int numTilesY
-) {
-    int tileX = blockIdx.x;
-    int tileY = blockIdx.y;
-    if (tileX >= numTilesX || tileY >= numTilesY) return;
-
-    int tileIndex = tileY * numTilesX + tileX;
-    
-    // tile boundaries
-    int tileStartX = tileX * TILE_SIZE;
-    int tileStartY = tileY * TILE_SIZE;
-    int tileEndX = min(tileStartX + TILE_SIZE, imageWidth);
-    int tileEndY = min(tileStartY + TILE_SIZE, imageHeight);
-    
-    // TODO: optimziation opportunity: parallelize this no inter dependencies
-    // loop through pixels in tile
-    for (int py = threadIdx.y; py < TILE_SIZE; py += blockDim.y) {
-        for (int px = threadIdx.x; px < TILE_SIZE; px += blockDim.x) {
-            int pixelX = tileStartX + px;
-            int pixelY = tileStartY + py;
-            
-            if (pixelX >= imageWidth || pixelY >= imageHeight) continue;
-
-            // // Debug output for pixel of interest
-            // if (pixelX == 16 && pixelY == 0) {
-            //     printf("\nProcessing pixel [16,0]:\n");
-            //     printf("Thread indices: [%d,%d]\n", threadIdx.x, threadIdx.y);
-            //     printf("Loop indices px=%d, py=%d\n", px, py);
-            // }
-
-            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-            
-            float invWidth = 1.f / imageWidth;
-            float invHeight = 1.f / imageHeight;
-            float2 pixelCenterNorm = make_float2(
-                invWidth * (static_cast<float>(pixelX) + 0.5f),
-                invHeight * (static_cast<float>(pixelY) + 0.5f));
-
-            int startOffset = tileOffsets[tileIndex];
-            int endOffset = tileOffsets[tileIndex + 1];
-            
-            // loop through circles to blend into pixels in order
-            for (int i = startOffset; i < endOffset; i++) {
-                int circleIndex = tileCircleLists[i];
-                int index3 = 3 * circleIndex;
-                float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-                shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
-            }
-        }
-    }
-}
-
 // pack the data for a circle next to each other for quick access
 struct CircleData {
     float3 position;
