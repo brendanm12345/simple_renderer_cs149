@@ -1,0 +1,31 @@
+Rendering to 1024x1024 image
+Loaded data for 100000 circles from snow.par
+Loaded scene with 100000 circles
+Loaded data for 100000 circles from snow.par
+Loaded scene with 100000 circles
+---------------------------------------------------------
+Initializing CUDA for CudaRenderer
+Found 1 CUDA devices
+Device 0: NVIDIA T4G
+   SMs:        40
+   Global mem: 14918 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+
+Running benchmark, 1 frames, beginning at frame 0 ...
+Dumping frames to logs/output_xxx.ppm
+Setting background at [0][0] to 0.850000
+Setting background at [0][1] to 0.849560
+Setting background at [0][0] to 0.850000
+Setting background at [0][1] to 0.849560
+Copying image data from device
+Wrote image file logs/output_0000.ppm
+Copying image data from device
+***************** Correctness check passed **************************
+Clear:    0.2525 ms
+Advance:  0.0026 ms
+Render:   2.4807 ms
+Total:    2.7358 ms
+File IO:  87.3200 ms
+
+Overall:  0.4579 sec (note units are seconds)
