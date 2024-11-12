@@ -9,6 +9,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/device_malloc.h>
 #include <thrust/device_free.h>
+#include <thrust/reduce.h>
 
 #include "CycleTimer.h"
 
@@ -49,6 +50,7 @@ __global__ void scan_downsweep(int N, int two_d, int two_dplus1, int* result) {
 __global__ void set_last_elem_zero(int N, int *result) {
     result[N - 1] = 0;
 }
+
 
 // exclusive_scan --
 //
@@ -96,8 +98,7 @@ void exclusive_scan(int* input, int N, int* result)
 
         scan_upsweep<<<numBlocks, THREADS_PER_BLOCK>>>(numOperations, two_d, two_dplus1, result);
         cudaDeviceSynchronize();
-
-
+        stride *= 2;
     }
 
     // setting result[N-1] = 0
@@ -206,7 +207,6 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
-
 __global__ void find_equal_neighbors(const int* input, int N, int* flags_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N - 1) {
@@ -235,7 +235,6 @@ __global__ void write_repeated_indices(const int* flags, const int* scan_result,
 //
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
-
     // CS149 TODO:
     //
     // Implement this function. You will probably want to
