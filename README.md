@@ -4,6 +4,8 @@
 
 Stanford University, CS 149 Assignment 3. Authors: Brendan McLaughlin (BS'24, MS'25), Robby Manihani (BS'26), under the guidance of Professor Kayvon Fatahalian
 
+[Assignment Write-Up / Design Doc](https://github.com/user-attachments/files/18313076/CS149.Assignment.3.pdf)
+
 Jump to kernel implementations:
 - [render/cudaRenderer.cu](render/cudaRenderer.cu)
 - [scan/scan.cu](scan/scan.cu)
